@@ -1,1 +1,268 @@
+# .github/workflows/epg.yml
 
+name: Generate EPG
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  epg:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 45
+
+    steps:
+
+      # ============================================
+      # CHECKOUT
+      # ============================================
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ============================================
+      # CLONE IPTV-ORG
+      # ============================================
+
+      - name: Clone IPTV-ORG EPG
+        run: |
+          git clone --depth=1 https://github.com/iptv-org/epg.git
+
+      # ============================================
+      # NODE.JS
+      # ============================================
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: epg/package-lock.json
+
+      # ============================================
+      # INSTALL DEPENDENCIES
+      # ============================================
+
+      - name: Install Dependencies
+        run: |
+          cd epg
+          npm ci
+
+      # ============================================
+      # CREATE DIRECTORIES
+      # ============================================
+
+      - name: Create Directories
+        run: |
+          mkdir -p epg/sites/custom
+          mkdir -p output
+
+      # ============================================
+      # VALIDATE XML
+      # ============================================
+
+      - name: Validate Channels XML
+        run: |
+          if [ ! -f channels/channels.xml ]; then
+            echo "ERRO: channels/channels.xml não encontrado!"
+            exit 1
+          fi
+
+      # ============================================
+      # COPY XML
+      # ============================================
+
+      - name: Copy Channels XML
+        run: |
+          cp channels/channels.xml epg/sites/custom/channels.xml
+
+      # ============================================
+      # REMOVE DUPLICATE CHANNELS
+      # ============================================
+
+      - name: Remove Duplicate Channels
+        run: |
+          python3 << 'EOF'
+          import xml.etree.ElementTree as ET
+
+          file = 'epg/sites/custom/channels.xml'
+
+          tree = ET.parse(file)
+          root = tree.getroot()
+
+          seen = set()
+          remove = []
+
+          for ch in root.findall('channel'):
+              key = (
+                  ch.attrib.get('site', ''),
+                  ch.attrib.get('site_id', ''),
+                  ch.attrib.get('xmltv_id', '')
+              )
+
+              if key in seen:
+                  remove.append(ch)
+              else:
+                  seen.add(key)
+
+          for ch in remove:
+              root.remove(ch)
+
+          tree.write(file, encoding='utf-8', xml_declaration=True)
+
+          print(f'Removidos {len(remove)} canais duplicados.')
+          EOF
+
+      # ============================================
+      # FILTER INVALID PROVIDERS
+      # ============================================
+
+      - name: Filter Invalid Providers
+        run: |
+          python3 << 'EOF'
+          import os
+          import xml.etree.ElementTree as ET
+
+          xml_file = 'epg/sites/custom/channels.xml'
+
+          valid_sites = {
+              d for d in os.listdir('epg/sites')
+              if os.path.isdir(os.path.join('epg/sites', d))
+          }
+
+          tree = ET.parse(xml_file)
+          root = tree.getroot()
+
+          removed = 0
+
+          for channel in list(root.findall('channel')):
+              site = channel.attrib.get('site')
+
+              if site not in valid_sites:
+                  root.remove(channel)
+                  removed += 1
+
+          tree.write(xml_file, encoding='utf-8', xml_declaration=True)
+
+          print(f'Removidos {removed} providers inválidos.')
+          EOF
+
+      # ============================================
+      # VALIDATE FINAL CHANNEL COUNT
+      # ============================================
+
+      - name: Validate Channel Count
+        run: |
+          COUNT=$(grep -c "<channel" epg/sites/custom/channels.xml || true)
+
+          echo "Canais restantes: $COUNT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "ERRO: Nenhum canal válido restante!"
+            exit 1
+          fi
+
+      # ============================================
+      # SHOW CHANNEL COUNT
+      # ============================================
+
+      - name: Show Channel Statistics
+        run: |
+          echo "Total de canais válidos:"
+          grep -c "<channel" epg/sites/custom/channels.xml
+
+      # ============================================
+      # GENERATE EPG WITH RETRY
+      # ============================================
+
+      - name: Generate EPG
+        run: |
+          cd epg
+
+          success=0
+
+          for i in 1 2 3
+          do
+            echo "Tentativa $i..."
+
+            npm run grab -- \
+              --channels=./sites/custom/channels.xml \
+              --days=3 \
+              --output=../output/guide.xml && success=1 && break
+
+            echo "Falhou tentativa $i"
+            sleep 20
+          done
+
+          if [ "$success" -ne 1 ]; then
+            echo "ERRO: Falha ao gerar EPG!"
+            exit 1
+          fi
+
+      # ============================================
+      # VALIDATE GENERATED FILE
+      # ============================================
+
+      - name: Validate Generated EPG
+        run: |
+          if [ ! -f output/guide.xml ]; then
+            echo "ERRO: guide.xml não encontrado!"
+            exit 1
+          fi
+
+          if [ ! -s output/guide.xml ]; then
+            echo "ERRO: guide.xml vazio!"
+            exit 1
+          fi
+
+          echo "guide.xml gerado com sucesso."
+
+      # ============================================
+      # COMPRESS FILE
+      # ============================================
+
+      - name: Compress Guide
+        run: |
+          gzip -fk output/guide.xml
+
+      # ============================================
+      # SHOW FILE SIZE
+      # ============================================
+
+      - name: Show Output Size
+        run: |
+          ls -lh output/
+
+      # ============================================
+      # UPLOAD ARTIFACT
+      # ============================================
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: epg
+          path: |
+            output/guide.xml
+            output/guide.xml.gz
+
+      # ============================================
+      # COMMIT GENERATED FILES
+      # ============================================
+
+      - name: Commit Generated Files
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+
+          git add output/guide.xml output/guide.xml.gz
+
+          git diff --cached --quiet && echo "Nenhuma alteração." && exit 0
+
+          git commit -m "Automatic EPG update"
+
+          git push
